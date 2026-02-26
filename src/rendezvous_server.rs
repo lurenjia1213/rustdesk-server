@@ -103,6 +103,7 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+static FORCE_PUNCH: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
@@ -202,9 +203,24 @@ impl RendezvousServer {
         {
             ALWAYS_USE_RELAY.store(true, Ordering::Relaxed);
         }
+        if std::env::var("FORCE_PUNCH")
+            .unwrap_or_default()
+            .to_uppercase()
+            == "Y"
+        {
+            FORCE_PUNCH.store(true, Ordering::Relaxed);
+        }
         log::info!(
             "ALWAYS_USE_RELAY={}",
             if ALWAYS_USE_RELAY.load(Ordering::Relaxed) {
+                "Y"
+            } else {
+                "N"
+            }
+        );
+        log::info!(
+            "FORCE_PUNCH={}",
+            if FORCE_PUNCH.load(Ordering::Relaxed) {
                 "Y"
             } else {
                 "N"
@@ -864,9 +880,11 @@ impl RendezvousServer {
 
         if let Ok(t) = phs.nat_type.enum_value() {
             // 如果不是强制启用relay，并且支持ipv6，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
-            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+            if (!ALWAYS_USE_RELAY.load(Ordering::Relaxed)
                 && !phs.socket_addr_v6.is_empty()
-                && t == NatType::SYMMETRIC
+                && t == NatType::SYMMETRIC)
+                || ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+            //如果强制打洞选项被打开，则不管什么情况都把nat类型改为非对称NAT
             {
                 p.set_nat_type(NatType::ASYMMETRIC);
             } else {
@@ -1181,12 +1199,13 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "always-use-relay(aur) [Y|N]",
+                    "force-punch(afp) [Y|N]",
                     "test-geo(tg) <ip1> <ip2>",
                     "must-login(ml) [Y|N]",
                 )
@@ -1299,6 +1318,21 @@ impl RendezvousServer {
                         res,
                         "ALWAYS_USE_RELAY: {:?}",
                         ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+                    );
+                }
+            }
+            Some("force-punch" | "afp") => {
+                if let Some(rs) = fds.next() {
+                    if rs.to_uppercase() == "Y" {
+                        FORCE_PUNCH.store(true, Ordering::Relaxed);
+                    } else {
+                        FORCE_PUNCH.store(false, Ordering::Relaxed);
+                    }
+                } else {
+                    let _ = writeln!(
+                        res,
+                        "FORCE_PUNCH: {:?}",
+                        FORCE_PUNCH.load(Ordering::Relaxed)
                     );
                 }
             }
