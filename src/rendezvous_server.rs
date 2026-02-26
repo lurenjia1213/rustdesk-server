@@ -835,8 +835,11 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            upnp_port: phs.upnp_port,
+            socket_addr_v6: phs.socket_addr_v6.clone(),
             ..Default::default()
         };
+
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
@@ -869,6 +872,7 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            socket_addr_v6: la.socket_addr_v6.clone(),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -970,6 +974,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6: ph.socket_addr_v6.clone(),
                     ..Default::default()
                 });
             } else {
@@ -983,6 +988,10 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    udp_port: ph.udp_port,
+                    force_relay: ph.force_relay,
+                    upnp_port: ph.upnp_port,
+                    socket_addr_v6: ph.socket_addr_v6.clone(),
                     ..Default::default()
                 });
             }
@@ -1004,7 +1013,7 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
-        let mut states = self.peers_online_state(peers).await;
+        let states = self.peers_online_state(peers).await;
 
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_response(OnlineResponse {
