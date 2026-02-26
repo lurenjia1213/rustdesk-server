@@ -863,7 +863,15 @@ impl RendezvousServer {
         };
 
         if let Ok(t) = phs.nat_type.enum_value() {
-            p.set_nat_type(t);
+            // 如果不是强制启用relay，并且支持ipv6，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
+            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+                && !phs.socket_addr_v6.is_empty()
+                && t == NatType::SYMMETRIC
+            {
+                p.set_nat_type(NatType::ASYMMETRIC);
+            } else {
+                p.set_nat_type(t);
+            }
         }
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
@@ -976,6 +984,12 @@ impl RendezvousServer {
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+            }
+            //有v6地址，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
+            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed) && !ph.socket_addr_v6.is_empty() {
+                if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC) {
+                    ph.nat_type = NatType::ASYMMETRIC.into();
+                }
             }
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
