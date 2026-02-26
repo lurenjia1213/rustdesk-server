@@ -3,6 +3,12 @@
 
 
 
+## 这是在lejianwen大佬的fork上修改的，自用为主，参考了rustdesk原版客户端对ipv6支持的相关代码，增加了ipv6直连的支持和udp打洞 ipv6直连看起来是没问题了，udp的没测，欢迎pr
+
+action构建没空修了，自己编译吧，或者pr一下也好
+
+随缘从大佬的仓库 cherry-pick 相关代码
+
 [![build](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml)
 
 - 解决当客户端登录了`API`账号时链接超时的问题

@@ -1,6 +1,9 @@
 
 # About this repository
 
+a modified rustdesk-server that support ipv6(tested) and udp punch hold(no test)
+currently ,self use only,pr welcome
+
 [![build](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/lejianwen/rustdesk-server/actions/workflows/build.yaml)
 
 - Solves the issue of connection timeout when the client logs in with an `API` account
