@@ -878,12 +878,24 @@ impl RendezvousServer {
             ..Default::default()
         };
 
+        // inform peer that this is a UDP-based punch reply so the client
+        // side can configure its own socket before dialing.  We only mark
+        // the response as UDP when the incoming "punch hole sent" message
+        // arrived on our UDP listener (socket.is_some()).  the client code
+        // checks `ph.is_udp` when deciding whether to bind/connect its
+        // local UDP socket.
+        if socket.is_some() {
+            p.is_udp = true;
+        } //很奇怪，似乎得在这里设置udp才能打洞？在客户端搜索is_udp
+          //一般来说，请求是udp的，如果请求是tcp，那么就意味着必须走中继了
+          //这里设置is_udp=true，不影响必要情况下的tcp中继和直连，
+
         if let Ok(t) = phs.nat_type.enum_value() {
             // 如果不是强制启用relay，并且支持ipv6，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
             if (!ALWAYS_USE_RELAY.load(Ordering::Relaxed)
                 && !phs.socket_addr_v6.is_empty()
                 && t == NatType::SYMMETRIC)
-                || ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+                || FORCE_PUNCH.load(Ordering::Relaxed)
             //如果强制打洞选项被打开，则不管什么情况都把nat类型改为非对称NAT
             {
                 p.set_nat_type(NatType::ASYMMETRIC);
@@ -892,9 +904,20 @@ impl RendezvousServer {
             }
         }
         msg_out.set_punch_hole_response(p);
+
+        // send the response twice to improve reliability over lossy UDP
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            for _ in 0..2 {
+                //发两次
+                socket.send(&msg_out, addr_a).await?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         } else {
+            // when we don't have a concrete socket we fall back to using
+            // the generic tx path; that path itself sends over the UDP
+            // listener stored in `io_loop`, so duplicates are still useful.
+            self.send_to_tcp(msg_out.clone(), addr_a).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
@@ -925,9 +948,17 @@ impl RendezvousServer {
         };
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
+
+        // duplicate sends for UDP path just like we do in handle_hole_sent
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            for _ in 0..2 {
+                //发两次
+                socket.send(&msg_out, addr_a).await?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         } else {
+            self.send_to_tcp(msg_out.clone(), addr_a).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
