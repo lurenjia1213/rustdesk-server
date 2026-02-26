@@ -1,6 +1,5 @@
 use crate::common::*;
 use crate::peer::*;
-use hbb_common::bytes::BufMut;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -17,11 +16,8 @@ use hbb_common::{
         register_pk_response::Result::{INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    sodiumoxide::crypto::{
-        box_, box_::PublicKey, box_::SecretKey, secretbox, secretbox::Key, secretbox::Nonce, sign,
-    },
+    sodiumoxide::crypto::{box_, box_::PublicKey, box_::SecretKey, secretbox, sign},
     sodiumoxide::hex,
-    tcp,
     tcp::Encrypt,
     tcp::{listen_any, FramedStream},
     timeout,
@@ -40,7 +36,6 @@ use hbb_common::{
 use ipnetwork::Ipv4Network;
 
 use crate::jwt;
-use std::io::Error;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -102,6 +97,17 @@ type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
+/// Peer cleanup interval in seconds. Override via env var `CLEANUP_INTERVAL_SECS`.
+/// Lower values free memory faster under high churn; higher values reduce lock contention.
+static CLEANUP_INTERVAL_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+fn get_cleanup_interval() -> u64 {
+    *CLEANUP_INTERVAL_SECS.get_or_init(|| {
+        std::env::var("CLEANUP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60)
+    })
+}
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static FORCE_PUNCH: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
@@ -120,14 +126,18 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    /// Stores TCP sink + insertion timestamp for each in-flight TCP punch session.
+    /// The timestamp is used by the periodic cleanup timer to evict stale entries.
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, Instant)>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    /// Stores WebSocket sink + insertion timestamp for each registered WS peer.
+    /// The timestamp allows the cleanup timer to evict long-idle entries.
+    ws_map: Arc<Mutex<HashMap<SocketAddr, (Sink, Instant)>>>,
 }
 
 enum LoopFailure {
@@ -309,6 +319,7 @@ impl RendezvousServer {
         )
     }
 
+    #[inline]
     async fn io_loop(
         &mut self,
         rx: &mut Receiver,
@@ -319,6 +330,9 @@ impl RendezvousServer {
         key: &str,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        // Periodic eviction of stale punch/ws signaling entries and inactive peers.
+        // Interval is configurable via CLEANUP_INTERVAL_SECS env var (default 60 s).
+        let mut timer_cleanup = interval(Duration::from_secs(get_cleanup_interval()));
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
@@ -329,6 +343,31 @@ impl RendezvousServer {
                             check_relay_servers(rs, tx).await;
                         });
                     }
+                }
+                _ = timer_cleanup.tick() => {
+                    // TCP punch entries should complete within 90 s; drop stragglers.
+                    {
+                        let mut lock = self.tcp_punch.lock().await;
+                        let before = lock.len();
+                        lock.retain(|_, (_, t)| t.elapsed().as_secs() < 90);
+                        let after = lock.len();
+                        if before != after {
+                            log::info!("tcp_punch cleanup: removed {} stale entries, {} remaining", before - after, after);
+                        }
+                    }
+                    // WS map entries for registered peers; evict if idle for 300 s.
+                    {
+                        let mut lock = self.ws_map.lock().await;
+                        let before = lock.len();
+                        lock.retain(|_, (_, t)| t.elapsed().as_secs() < 300);
+                        let after = lock.len();
+                        if before != after {
+                            log::info!("ws_map cleanup: removed {} stale entries, {} remaining", before - after, after);
+                        }
+                    }
+                    // Evict peers that have not re-registered recently from memory;
+                    // they remain in the database and will be reloaded on next access.
+                    self.pm.cleanup_memory().await;
                 }
                 Some(data) = rx.recv() => {
                     match data {
@@ -561,7 +600,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), (sink, Instant::now()));
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
@@ -569,7 +611,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), (sink, Instant::now()));
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -643,7 +688,10 @@ impl RendezvousServer {
                             if ws {
                                 // for ws, we can only get addr when register_pk
                                 if let Some(sink) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), sink);
+                                    self.ws_map
+                                        .lock()
+                                        .await
+                                        .insert(try_into_v4(addr), (sink, Instant::now()));
                                 }
                             }
                             return true;
@@ -658,13 +706,31 @@ impl RendezvousServer {
                     }
                     log::trace!("KeyExchange their_pk: {:?}", hex::encode(&ex.keys[0]));
                     log::trace!("KeyExchange box: {:?}", hex::encode(&ex.keys[1]));
-                    let their_pk: [u8; 32] = ex.keys[0].to_vec().try_into().unwrap();
-                    let cryptobox: [u8; 48] = ex.keys[1].to_vec().try_into().unwrap();
-                    let symetric_key = get_symetric_key_from_msg(
+                    let their_pk: [u8; 32] = match ex.keys[0].to_vec().try_into() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            log::error!("Handshake failed: invalid public key length");
+                            return false;
+                        }
+                    };
+                    let cryptobox: [u8; 48] = match ex.keys[1].to_vec().try_into() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            log::error!("Handshake failed: invalid sealed box length");
+                            return false;
+                        }
+                    };
+                    let symetric_key = match get_symetric_key_from_msg(
                         self.inner.secure_tcp_sk_b.0,
                         their_pk,
                         &cryptobox,
-                    );
+                    ) {
+                        Some(k) => k,
+                        None => {
+                            log::error!("Handshake failed: could not derive symmetric key");
+                            return false;
+                        }
+                    };
                     log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
@@ -685,7 +751,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::OnlineRequest(or)) => {
-                    let mut states = self.peers_online_state(or.peers).await;
+                    let states = self.peers_online_state(or.peers).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_online_response(OnlineResponse {
                         states: states.into(),
@@ -871,30 +937,95 @@ impl RendezvousServer {
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
-            pk: self.get_pk(&phs.version, phs.id).await,
+            pk: self.get_pk(&phs.version, phs.id.clone()).await,
             relay_server: phs.relay_server.clone(),
             upnp_port: phs.upnp_port,
             socket_addr_v6: phs.socket_addr_v6.clone(),
             ..Default::default()
         };
 
+        // inform peer that this is a UDP-based punch reply so the client
+        // side can configure its own socket before dialing.  We only mark
+        // the response as UDP when the incoming "punch hole sent" message
+        // arrived on our UDP listener (socket.is_some()).  the client code
+        // checks `ph.is_udp` when deciding whether to bind/connect its
+        // local UDP socket.
+        if socket.is_some() {
+            p.is_udp = true;
+        } //很奇怪，似乎得在这里设置udp才能打洞？在客户端搜索is_udp
+          //一般来说，请求是udp的，如果请求是tcp，那么就意味着必须走中继了
+          //这里设置is_udp=true，不影响必要情况下的tcp中继和直连，
+
+        // Determine whether the server is forcing relay for this connection.
+        // ALWAYS_USE_RELAY is a global flag; lan_wan_mismatch is per-connection
+        // (one peer in LAN, the other in WAN).
+        let server_force_relay =
+            ALWAYS_USE_RELAY.load(Ordering::Relaxed) || (self.is_lan(addr) ^ self.is_lan(addr_a));
+
         if let Ok(t) = phs.nat_type.enum_value() {
-            // 如果不是强制启用relay，并且支持ipv6，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
-            if (!ALWAYS_USE_RELAY.load(Ordering::Relaxed)
-                && !phs.socket_addr_v6.is_empty()
-                && t == NatType::SYMMETRIC)
-                || ALWAYS_USE_RELAY.load(Ordering::Relaxed)
-            //如果强制打洞选项被打开，则不管什么情况都把nat类型改为非对称NAT
+            if server_force_relay {
+                // Tell A that B is SYMMETRIC so A uses a minimal punch timeout
+                // (1 s on current clients) and falls back to relay quickly.
+                p.set_nat_type(NatType::SYMMETRIC);
+            } else if (!phs.socket_addr_v6.is_empty() && t == NatType::SYMMETRIC)
+                || FORCE_PUNCH.load(Ordering::Relaxed)
             {
+                // B's nat_type is SYMMETRIC → but B has a live IPv6 addr, so
+                // direct IPv6 punch will likely work.  Override to ASYMMETRIC
+                // so A doesn't fall back to relay immediately.
+                // FORCE_PUNCH overrides everything.
                 p.set_nat_type(NatType::ASYMMETRIC);
             } else {
                 p.set_nat_type(t);
             }
         }
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+
+        // Cache B's IPv6 address into the peer record so that future
+        // handle_punch_hole_request calls can see that B has IPv6 capability
+        // without waiting for another PunchHoleSent round-trip.
+        if !phs.socket_addr_v6.is_empty() {
+            let v6 = AddrMangle::decode(&phs.socket_addr_v6);
+            if v6.port() > 0 {
+                if let Some(peer) = self.pm.get_in_memory(&phs.id).await {
+                    peer.write().await.socket_addr_v6 = v6;
+                }
+            }
+        }
+
+        // Send PunchHoleResponse back to A.
+        //
+        // A always connects to the rendezvous server via TCP (or WebSocket),
+        // so we must deliver the response through A's TCP/WS sink regardless
+        // of how B's PunchHoleSent arrived (UDP or TCP).  The old code used
+        // the UDP socket when PunchHoleSent came over UDP, which meant the
+        // response was sent to A's TCP source address over UDP – A never
+        // received it, causing UDP punch to silently fail every time.
+        let tcp_sink = self
+            .tcp_punch
+            .lock()
+            .await
+            .remove(&try_into_v4(addr_a))
+            .map(|(s, _)| s);
+        if let Some(mut sink) = tcp_sink {
+            // A has a TCP punch sink – deliver via TCP (send twice for
+            // reliability, matching the original duplicate-send pattern).
+            sink.send(&msg_out).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sink.send(&msg_out).await;
+        } else if let Some(socket) = socket {
+            // Fallback: no TCP sink found (A may have connected via UDP
+            // directly – unlikely in current client code, but kept for
+            // forward-compatibility).
+            for _ in 0..2 {
+                socket.send(&msg_out, addr_a).await?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         } else {
+            // Last resort: try the generic send_to_tcp path (which also
+            // looks up tcp_punch – will be a no-op if already drained).
+            self.send_to_tcp(msg_out.clone(), addr_a).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
@@ -918,16 +1049,44 @@ impl RendezvousServer {
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
-            pk: self.get_pk(&la.version, la.id).await,
+            pk: self.get_pk(&la.version, la.id.clone()).await,
             relay_server: la.relay_server,
             socket_addr_v6: la.socket_addr_v6.clone(),
             ..Default::default()
         };
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+
+        // Cache B's IPv6 from the LocalAddr message for future hole-punch decisions.
+        if !la.socket_addr_v6.is_empty() {
+            let v6 = AddrMangle::decode(&la.socket_addr_v6);
+            if v6.port() > 0 {
+                if let Some(peer) = self.pm.get_in_memory(&la.id).await {
+                    peer.write().await.socket_addr_v6 = v6;
+                }
+            }
+        }
+
+        // Send PunchHoleResponse (is_local) back to A via TCP, same fix
+        // as handle_hole_sent: A connects via TCP so we must reply on TCP.
+        let tcp_sink = self
+            .tcp_punch
+            .lock()
+            .await
+            .remove(&try_into_v4(addr_a))
+            .map(|(s, _)| s);
+        if let Some(mut sink) = tcp_sink {
+            sink.send(&msg_out).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sink.send(&msg_out).await;
+        } else if let Some(socket) = socket {
+            for _ in 0..2 {
+                socket.send(&msg_out, addr_a).await?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         } else {
+            self.send_to_tcp(msg_out.clone(), addr_a).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
@@ -950,7 +1109,7 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        // if secret is not empty check token by jwt
+        // if MUST_LOGIN is enabled, verify JWT token
         if MUST_LOGIN.load(Ordering::Relaxed) {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
@@ -959,13 +1118,22 @@ impl RendezvousServer {
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
-            } else if !jwt::SECRET.is_empty() {
-                let token = ph.token;
-                let token = jwt::verify_token(token.as_str());
+            } else if jwt::SECRET.is_empty() {
+                // JWT secret not configured but login is required — reject to avoid bypass
+                log::warn!("MUST_LOGIN is enabled but RUSTDESK_API_JWT_KEY is not set, rejecting connection");
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: String::from(
+                        "Server JWT is not configured, please contact the administrator!",
+                    ),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            } else {
+                let token = jwt::verify_token(ph.token.as_str());
                 if token.is_err() {
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
-                        //提示重新登录
                         other_failure: String::from("Token error, please log out and log back in!"),
                         ..Default::default()
                     });
@@ -980,9 +1148,16 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr) = {
+            let (elapsed, peer_addr, peer_has_ipv6) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                // B has IPv6 if it registered with an IPv6 socket_addr (dual-stack), or if it
+                // previously reported a live IPv6 punch address via PunchHoleSent / LocalAddr.
+                let has_v6 = r.socket_addr.is_ipv6() || r.socket_addr_v6.port() > 0;
+                (
+                    r.last_reg_time.elapsed().as_millis() as i32,
+                    r.socket_addr,
+                    has_v6,
+                )
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -996,25 +1171,66 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::Relaxed) || (peer_is_lan ^ is_lan) {
+            // Track whether we are forcing relay due to LAN/WAN mismatch
+            let lan_wan_mismatch = peer_is_lan ^ is_lan;
+            if ALWAYS_USE_RELAY.load(Ordering::Relaxed) || lan_wan_mismatch {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
                 }
+                if lan_wan_mismatch {
+                    log::debug!(
+                        "LAN/WAN mismatch (peer_is_lan={} is_lan={}) for {:?}↔{:?}: will use relay",
+                        peer_is_lan,
+                        is_lan,
+                        addr,
+                        peer_addr
+                    );
+                }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
-            //有v6地址，并且nat类型是对称NAT，则改为非对称NAT，增加直连成功率
-            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed) && !ph.socket_addr_v6.is_empty() {
+            // Override SYMMETRIC → ASYMMETRIC only when BOTH ends are known to have IPv6.
+            //
+            // Rationale:
+            //   • If only A has IPv6, B will call start_ipv6() but get_ipv6_socket() returns
+            //     None, so B's PunchHoleSent.socket_addr_v6 stays empty.  A receives an empty
+            //     socket_addr_v6 and won't even attempt IPv6 – the ASYMMETRIC override gained
+            //     nothing but delayed fallback to relay.
+            //   • When BOTH have IPv6, direct IPv6 punch succeeds far more often because
+            //     IPv6 typically does not go through NAT at all.
+            //   • We intentionally leave SYMMETRIC intact when lan_wan_mismatch forced it:
+            //     the client (B) still starts its IPv6 listener before entering the relay path
+            //     and will include socket_addr_v6 in RelayResponse, letting A race relay vs
+            //     direct IPv6 – which is faster than waiting for TCP punch to time out.
+            let a_has_ipv6 = !ph.socket_addr_v6.is_empty();
+            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+                && a_has_ipv6
+                && peer_has_ipv6
+                && !lan_wan_mismatch
+            {
                 if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC) {
+                    log::debug!(
+                        "Both A ({:?}) and B ({:?}) have IPv6 – overriding SYMMETRIC to ASYMMETRIC",
+                        addr,
+                        peer_addr
+                    );
                     ph.nat_type = NatType::ASYMMETRIC.into();
                 }
             }
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
+                    // Compare IPs for same-host detection, handling the case where one peer
+                    // connects via plain IPv4 and the other via an IPv4-mapped IPv6 address
+                    // (::ffff:x.x.x.x), which is common in dual-stack environments.
                     match (peer_addr, addr) {
                         (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
                         (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
+                        (SocketAddr::V4(a), SocketAddr::V6(b)) => {
+                            b.ip().to_ipv4().map(|v4| v4 == *a.ip()).unwrap_or(false)
+                        }
+                        (SocketAddr::V6(a), SocketAddr::V4(b)) => {
+                            a.ip().to_ipv4().map(|v4| v4 == *b.ip()).unwrap_or(false)
+                        }
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
@@ -1038,12 +1254,29 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
+                // Apply FORCE_PUNCH as the final nat_type override: instruct B to attempt a
+                // direct hole punch even when A appears to be behind a SYMMETRIC NAT.
+                // ALWAYS_USE_RELAY takes precedence and is never overridden here.
+                let final_nat_type = if FORCE_PUNCH.load(Ordering::Relaxed)
+                    && !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
+                    && ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+                {
+                    log::debug!(
+                        "FORCE_PUNCH: overriding nat_type → ASYMMETRIC in PunchHole to B {:?}",
+                        peer_addr
+                    );
+                    NatType::ASYMMETRIC.into()
+                } else {
+                    ph.nat_type
+                };
+                let server_force_relay =
+                    ALWAYS_USE_RELAY.load(Ordering::Relaxed) || lan_wan_mismatch;
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
-                    nat_type: ph.nat_type,
+                    nat_type: final_nat_type,
                     relay_server,
                     udp_port: ph.udp_port,
-                    force_relay: ph.force_relay,
+                    force_relay: ph.force_relay || server_force_relay,
                     upnp_port: ph.upnp_port,
                     socket_addr_v6: ph.socket_addr_v6.clone(),
                     ..Default::default()
@@ -1081,7 +1314,12 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        let mut tcp = self
+            .tcp_punch
+            .lock()
+            .await
+            .remove(&try_into_v4(addr))
+            .map(|(s, _)| s);
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
         });
@@ -1100,7 +1338,12 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        let mut sink = self
+            .tcp_punch
+            .lock()
+            .await
+            .remove(&try_into_v4(addr))
+            .map(|(s, _)| s);
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
     }
@@ -1114,12 +1357,35 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
+        if let Some(peer_addr) = to_addr {
+            let mut sink = self
+                .ws_map
+                .lock()
+                .await
+                .remove(&try_into_v4(peer_addr))
+                .map(|(s, _)| s);
             if let Some(s) = sink.as_mut() {
+                // B has a live WebSocket – send the PunchHole notification twice for reliability.
+                log::debug!(
+                    "TCP punch: forwarding PunchHole to B {:?} via WebSocket",
+                    peer_addr
+                );
+                s.send(&msg).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 s.send(&msg).await;
             } else {
-                self.tx.send(Data::Msg(msg.into(), addr))?;
+                // B communicates via UDP: forward PunchHole via the UDP channel, doubled
+                // to tolerate packet loss. The second send is spawned to avoid blocking.
+                log::debug!(
+                    "TCP punch: forwarding PunchHole to B {:?} via UDP tx",
+                    peer_addr
+                );
+                self.tx.send(Data::Msg(msg.clone().into(), peer_addr))?;
+                let tx2 = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tx2.send(Data::Msg(msg.into(), peer_addr)).ok();
+                });
             }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
@@ -1135,13 +1401,19 @@ impl RendezvousServer {
         key: &str,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        let target = match to_addr {
+            Some(peer_addr) => peer_addr,
+            None => addr,
+        };
+        // Send the PunchHole (or error response) message to the target. A second copy
+        // is dispatched asynchronously after 10 ms to tolerate UDP packet loss without
+        // blocking the main UDP receive loop.
+        self.tx.send(Data::Msg(msg.clone().into(), target))?;
+        let tx2 = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx2.send(Data::Msg(msg.into(), target)).ok();
+        });
         Ok(())
     }
 
@@ -1307,12 +1579,7 @@ impl RendezvousServer {
             }
             Some("always-use-relay" | "aur") => {
                 if let Some(rs) = fds.next() {
-                    if rs.to_uppercase() == "Y" {
-                        ALWAYS_USE_RELAY.store(true, Ordering::Relaxed);
-                    } else {
-                        ALWAYS_USE_RELAY.store(false, Ordering::Relaxed);
-                    }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                    ALWAYS_USE_RELAY.store(rs.to_uppercase() == "Y", Ordering::Relaxed);
                 } else {
                     let _ = writeln!(
                         res,
@@ -1647,6 +1914,7 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 async fn send_rk_res(
     socket: &mut FramedSocket,
@@ -1684,7 +1952,7 @@ fn get_symetric_key_from_msg(
     our_sk_b: [u8; 32],
     their_pk_b: [u8; 32],
     sealed_value: &[u8; 48],
-) -> [u8; 32] {
+) -> Option<[u8; 32]> {
     let their_pk_b = box_::PublicKey(their_pk_b);
     let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
     let sk = box_::SecretKey(our_sk_b);
@@ -1693,8 +1961,11 @@ fn get_symetric_key_from_msg(
         Ok(key) => {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key);
-            key_array
+            Some(key_array)
         }
-        Err(e) => panic!("Error while opening the seal key{:?}", e),
+        Err(_) => {
+            log::error!("Failed to open sealed symmetric key during key exchange");
+            None
+        }
     }
 }

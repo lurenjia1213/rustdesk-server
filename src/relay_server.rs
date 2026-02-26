@@ -1,8 +1,9 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
 use hbb_common::{
     allow_err, bail,
-    bytes::{Bytes, BytesMut},
+    bytes::Bytes,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
     protobuf::Message as _,
@@ -14,14 +15,12 @@ use hbb_common::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{Mutex, RwLock},
         time::{interval, Duration},
     },
     ResultType,
 };
 use sodiumoxide::crypto::sign;
 use std::{
-    collections::{HashMap, HashSet},
     io::prelude::*,
     io::Error,
     net::SocketAddr,
@@ -30,13 +29,17 @@ use std::{
 
 type Usage = (usize, usize, usize, usize);
 
+type PeerEntry = (usize, Box<dyn StreamTrait>); // (insert_id, stream)
+
 lazy_static::lazy_static! {
-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
-    static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
-    static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
-    static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+    // DashMap/DashSet: shard-level locking for low contention under high concurrency
+    static ref PEERS: DashMap<String, PeerEntry> = Default::default();
+    static ref USAGE: DashMap<String, Usage> = Default::default();
+    static ref BLACKLIST: DashSet<String> = Default::default();
+    static ref BLOCKLIST: DashSet<String> = Default::default();
 }
 
+static PEER_INSERT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024); // in bit/s
@@ -51,33 +54,25 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split('\n') {
-                if let Some(ip) = x.trim().split(' ').next() {
-                    BLACKLIST.write().await.insert(ip.to_owned());
+            for x in contents.lines() {
+                if let Some(ip) = x.split_whitespace().next() {
+                    BLACKLIST.insert(ip.to_owned());
                 }
             }
         }
     }
-    log::info!(
-        "#blacklist({}): {}",
-        BLACKLIST_FILE,
-        BLACKLIST.read().await.len()
-    );
+    log::info!("#blacklist({}): {}", BLACKLIST_FILE, BLACKLIST.len());
     if let Ok(mut file) = std::fs::File::open(BLOCKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split('\n') {
-                if let Some(ip) = x.trim().split(' ').next() {
-                    BLOCKLIST.write().await.insert(ip.to_owned());
+            for x in contents.lines() {
+                if let Some(ip) = x.split_whitespace().next() {
+                    BLOCKLIST.insert(ip.to_owned());
                 }
             }
         }
     }
-    log::info!(
-        "#blocklist({}): {}",
-        BLOCKLIST_FILE,
-        BLOCKLIST.read().await.len()
-    );
+    log::info!("#blocklist({}): {}", BLOCKLIST_FILE, BLOCKLIST.len());
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -152,8 +147,8 @@ fn check_params() {
 async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     use std::fmt::Write;
 
-    let mut res = "".to_owned();
-    let mut fds = cmd.trim().split(' ');
+    let mut res = String::new();
+    let mut fds = cmd.split_whitespace();
     match fds.next() {
         Some("h") => {
             res = format!(
@@ -175,54 +170,62 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         Some("blacklist-add" | "ba") => {
             if let Some(ip) = fds.next() {
                 for ip in ip.split('|') {
-                    BLACKLIST.write().await.insert(ip.to_owned());
+                    BLACKLIST.insert(ip.to_owned());
                 }
             }
         }
         Some("blacklist-remove" | "br") => {
             if let Some(ip) = fds.next() {
                 if ip == "all" {
-                    BLACKLIST.write().await.clear();
+                    BLACKLIST.clear();
                 } else {
                     for ip in ip.split('|') {
-                        BLACKLIST.write().await.remove(ip);
+                        BLACKLIST.remove(ip);
                     }
                 }
             }
         }
         Some("blacklist" | "b") => {
             if let Some(ip) = fds.next() {
-                res = format!("{}\n", BLACKLIST.read().await.get(ip).is_some());
+                res = format!(
+                    "{}
+",
+                    BLACKLIST.contains(ip)
+                );
             } else {
-                for ip in BLACKLIST.read().await.clone().into_iter() {
-                    let _ = writeln!(res, "{ip}");
+                for r in BLACKLIST.iter() {
+                    let _ = writeln!(res, "{}", r.key());
                 }
             }
         }
         Some("blocklist-add" | "Ba") => {
             if let Some(ip) = fds.next() {
                 for ip in ip.split('|') {
-                    BLOCKLIST.write().await.insert(ip.to_owned());
+                    BLOCKLIST.insert(ip.to_owned());
                 }
             }
         }
         Some("blocklist-remove" | "Br") => {
             if let Some(ip) = fds.next() {
                 if ip == "all" {
-                    BLOCKLIST.write().await.clear();
+                    BLOCKLIST.clear();
                 } else {
                     for ip in ip.split('|') {
-                        BLOCKLIST.write().await.remove(ip);
+                        BLOCKLIST.remove(ip);
                     }
                 }
             }
         }
         Some("blocklist" | "B") => {
             if let Some(ip) = fds.next() {
-                res = format!("{}\n", BLOCKLIST.read().await.get(ip).is_some());
+                res = format!(
+                    "{}
+",
+                    BLOCKLIST.contains(ip)
+                );
             } else {
-                for ip in BLOCKLIST.read().await.clone().into_iter() {
-                    let _ = writeln!(res, "{ip}");
+                for r in BLOCKLIST.iter() {
+                    let _ = writeln!(res, "{}", r.key());
                 }
             }
         }
@@ -299,10 +302,8 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         }
         Some("usage" | "u") => {
             let mut tmp: Vec<(String, Usage)> = USAGE
-                .read()
-                .await
                 .iter()
-                .map(|x| (x.0.clone(), *x.1))
+                .map(|e| (e.key().clone(), *e.value()))
                 .collect();
             tmp.sort_by(|a, b| ((b.1).1).partial_cmp(&(a.1).1).unwrap());
             for (ip, (elapsed, total, highest, speed)) in tmp {
@@ -329,43 +330,55 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::Relaxed) as _);
-    loop {
-        tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, addr))  => {
-                        stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
-                    }
-                    Err(err) => {
-                       log::error!("listener.accept failed: {}", err);
-                       break;
-                    }
+
+    // Each listener gets its own independent task:
+    //   1. No select! overhead — no polling futures that aren't ready.
+    //   2. The two listeners accept in true parallel on different executor threads,
+    //      so a burst on one port cannot delay accepts on the other.
+
+    let key1 = key.to_owned();
+    let limiter1 = limiter.clone();
+    let t1 = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    stream.set_nodelay(true).ok();
+                    handle_connection(stream, addr, &limiter1, &key1, false);
                 }
-            }
-            res = listener2.accept() => {
-                match res {
-                    Ok((stream, addr))  => {
-                        stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, true).await;
-                    }
-                    Err(err) => {
-                       log::error!("listener2.accept failed: {}", err);
-                       break;
-                    }
+                Err(err) => {
+                    log::error!("listener.accept failed: {}", err);
+                    break;
                 }
             }
         }
+    });
+
+    let key2 = key.to_owned();
+    let limiter2 = limiter.clone();
+    let t2 = tokio::spawn(async move {
+        loop {
+            match listener2.accept().await {
+                Ok((stream, addr)) => {
+                    stream.set_nodelay(true).ok();
+                    handle_connection(stream, addr, &limiter2, &key2, true);
+                }
+                Err(err) => {
+                    log::error!("listener2.accept failed: {}", err);
+                    break;
+                }
+            }
+        }
+    });
+
+    // If either listener task ends (e.g. OS error), return to let the caller
+    // recreate both listeners from scratch.
+    tokio::select! {
+        _ = t1 => {}
+        _ = t2 => {}
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    addr: SocketAddr,
-    limiter: &Limiter,
-    key: &str,
-    ws: bool,
-) {
+fn handle_connection(stream: TcpStream, addr: SocketAddr, limiter: &Limiter, key: &str, ws: bool) {
     let ip = hbb_common::try_into_v4(addr).ip();
     if !ws && ip.is_loopback() {
         let limiter = limiter.clone();
@@ -382,7 +395,7 @@ async fn handle_connection(
         return;
     }
     let ip = ip.to_string();
-    if BLOCKLIST.read().await.get(&ip).is_some() {
+    if BLOCKLIST.contains(&ip) {
         log::info!("{} blocked", ip);
         return;
     }
@@ -434,11 +447,11 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
+                    let mut peer = PEERS.remove(&rf.uuid).map(|(_, (_, v))| v);
                     if let Some(peer) = peer.as_mut() {
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
-                        USAGE.write().await.insert(id.clone(), Default::default());
+                        USAGE.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
                             peer.set_raw();
                             stream.set_raw();
@@ -450,12 +463,15 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         } else {
                             log::info!("Relay of {} closed", addr);
                         }
-                        USAGE.write().await.remove(&id);
+                        USAGE.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        let insert_id = PEER_INSERT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        PEERS.insert(rf.uuid.clone(), (insert_id, Box::new(stream)));
                         sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
+                        // Only remove our own entry; a newer insertion with the
+                        // same uuid must not be accidentally evicted.
+                        PEERS.remove_if(&rf.uuid, |_, (id, _)| *id == insert_id);
                     }
                 }
             }
@@ -500,7 +516,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        stream.send_raw(bytes).await?;
                     }
                 } else {
                     break;
@@ -519,7 +535,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        peer.send_raw(bytes).await?;
                     }
                 } else {
                     break;
@@ -534,21 +550,24 @@ async fn relay(
 
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
-            if BLOCKLIST.read().await.get(&ip).is_some() {
+            if BLOCKLIST.contains(&ip) {
                 log::info!("{} blocked", ip);
                 break;
             }
-            blacked = BLACKLIST.read().await.get(&ip).is_some();
+            blacked = BLACKLIST.contains(&ip);
             tm = std::time::Instant::now();
             let speed = total_s / n;
             if speed > highest_s {
                 highest_s = speed;
             }
             elapsed += n;
-            USAGE.write().await.insert(
-                id.clone(),
-                (elapsed as _, total as _, highest_s as _, speed as _),
-            );
+            let usage = (elapsed as _, total as _, highest_s as _, speed as _);
+            if let Some(mut entry) = USAGE.get_mut(&id) {
+                *entry = usage;
+            } else {
+                // Should rarely happen (e.g. external removal); restore the usage entry.
+                USAGE.insert(id.clone(), usage);
+            }
             total_s = 0;
             if elapsed > DOWNGRADE_START_CHECK.load(Ordering::Relaxed)
                 && !downgrade
@@ -590,7 +609,8 @@ fn get_server_sk(key: &str) -> String {
 
 #[async_trait]
 trait StreamTrait: Send + Sync + 'static {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>>;
+    // Returns Bytes (not BytesMut) to avoid an extra allocation on the WS recv path
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>>;
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
@@ -598,8 +618,9 @@ trait StreamTrait: Send + Sync + 'static {
 
 #[async_trait]
 impl StreamTrait for FramedStream {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
-        self.next().await
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>> {
+        // BytesMut::freeze() is zero-copy
+        self.next().await.map(|r| r.map(|b| b.freeze()))
     }
 
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
@@ -617,15 +638,16 @@ impl StreamTrait for FramedStream {
 
 #[async_trait]
 impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
-    async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
+    async fn recv(&mut self) -> Option<Result<Bytes, Error>> {
         if let Some(msg) = self.next().await {
             match msg {
                 Ok(msg) => {
                     match msg {
                         tungstenite::Message::Binary(bytes) => {
-                            Some(Ok(bytes[..].into())) // to-do: poor performance
+                            // Bytes::from(Vec) is zero-copy (takes ownership)
+                            Some(Ok(Bytes::from(bytes)))
                         }
-                        _ => Some(Ok(BytesMut::new())),
+                        _ => Some(Ok(Bytes::new())),
                     }
                 }
                 Err(err) => Some(Err(Error::new(std::io::ErrorKind::Other, err.to_string()))),
@@ -636,9 +658,10 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
+        // tungstenite 0.17 requires Vec<u8>; one copy is unavoidable here
         Ok(self
             .send(tungstenite::Message::Binary(bytes.to_vec()))
-            .await?) // to-do: poor performance
+            .await?)
     }
 
     fn is_ws(&self) -> bool {

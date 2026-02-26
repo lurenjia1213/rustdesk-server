@@ -20,13 +20,30 @@ impl deadpool::managed::Manager for DbPool {
     async fn create(&self) -> Result<SqliteConnection, SqlxError> {
         let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
         opt.log_statements(log::LevelFilter::Debug);
-        SqliteConnection::connect_with(&opt).await
+        let mut conn = SqliteConnection::connect_with(&opt).await?;
+        // Enable WAL mode for better concurrent read performance
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .ok();
+        // Reduce fsync overhead while keeping crash safety
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&mut conn)
+            .await
+            .ok();
+        Ok(conn)
     }
     async fn recycle(
         &self,
-        obj: &mut SqliteConnection,
+        mut obj: &mut SqliteConnection,
     ) -> deadpool::managed::RecycleResult<SqlxError> {
-        Ok(obj.ping().await?)
+        // Use SELECT 1 instead of ping() — more reliable for SQLite
+        sqlx::query("SELECT 1")
+            .execute(obj.deref_mut())
+            .await
+            .map(|_| ())
+            .map_err(deadpool::managed::RecycleError::Backend)?;
+        Ok(())
     }
 }
 
@@ -34,7 +51,7 @@ impl deadpool::managed::Manager for DbPool {
 pub struct Database {
     pool: Pool,
 }
-
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct Peer {
     pub guid: Vec<u8>,
@@ -52,10 +69,10 @@ impl Database {
             std::fs::File::create(url).ok();
         }
         let n: usize = std::env::var("MAX_DATABASE_CONNECTIONS")
-            .unwrap_or_else(|_| "1".to_owned())
+            .unwrap_or_else(|_| "4".to_owned())
             .parse()
-            .unwrap_or(1);
-        log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
+            .unwrap_or(4);
+        log::info!("MAX_DATABASE_CONNECTIONS={}", n);
         let pool = Pool::new(
             DbPool {
                 url: url.to_owned(),
@@ -111,8 +128,10 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
+        // INSERT OR IGNORE: silently skip on duplicate id, avoids propagating
+        // a UniqueViolation error when two tasks race to register the same peer.
         sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
+            "insert or ignore into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
             guid,
             id,
             uuid,

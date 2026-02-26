@@ -1,8 +1,12 @@
 use clap::App;
+use dashmap::DashMap;
 use hbb_common::{
-    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
+    allow_err,
+    anyhow::{Context, Result},
+    get_version_number, log, tokio, ResultType,
 };
 use ini::Ini;
+use once_cell::sync::Lazy;
 use sodiumoxide::crypto::sign;
 use std::{
     io::prelude::*,
@@ -10,6 +14,10 @@ use std::{
     net::SocketAddr,
     time::{Instant, SystemTime},
 };
+
+/// Cache for `get_servers`: maps raw comma-separated string → parsed server list.
+/// Avoids repeated synchronous DNS resolution on every call.
+static SERVER_CACHE: Lazy<DashMap<String, Vec<String>>> = Lazy::new(DashMap::new);
 
 #[allow(dead_code)]
 pub(crate) fn get_expired_time() -> Instant {
@@ -37,12 +45,18 @@ pub(crate) fn test_if_valid_server(host: &str, name: &str) -> ResultType<SocketA
 
 #[allow(dead_code)]
 pub(crate) fn get_servers(s: &str, tag: &str) -> Vec<String> {
+    // Return cached result if the input string hasn't changed — avoids
+    // synchronous DNS resolution (ToSocketAddrs) on every call.
+    if let Some(cached) = SERVER_CACHE.get(s) {
+        return cached.clone();
+    }
     let servers: Vec<String> = s
         .split(',')
         .filter(|x| !x.is_empty() && test_if_valid_server(x, tag).is_ok())
         .map(|x| x.to_owned())
         .collect();
     log::info!("{}={:?}", tag, servers);
+    SERVER_CACHE.insert(s.to_owned(), servers.clone());
     servers
 }
 
@@ -86,7 +100,7 @@ pub fn init_args(args: &str, name: &str, about: &str) {
 #[allow(dead_code)]
 #[inline]
 pub fn get_arg(name: &str) -> String {
-    get_arg_or(name, "".to_owned())
+    get_arg_or(name, String::new())
 }
 
 #[allow(dead_code)]
@@ -189,7 +203,7 @@ pub async fn listen_signal() -> Result<()> {
     unreachable!();
 }
 
-
+#[allow(dead_code)]
 pub fn check_software_update() {
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
     std::thread::spawn(move || loop {
@@ -200,8 +214,10 @@ pub fn check_software_update() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
-    let latest_release_response = reqwest::Client::builder().build()?
+    let (request, url) =
+        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
+    let latest_release_response = reqwest::Client::builder()
+        .build()?
         .post(url)
         .json(&request)
         .send()
@@ -212,7 +228,7 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
     let response_url = resp.url;
     let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
     if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
-       log::info!("new version is available: {}", latest_release_version);
+        log::info!("new version is available: {}", latest_release_version);
     }
     Ok(())
 }
