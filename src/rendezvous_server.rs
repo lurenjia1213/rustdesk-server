@@ -431,6 +431,28 @@ impl RendezvousServer {
                         }
                     }
                 }
+                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                    log::debug!("Received TestNatRequest from {}", addr);
+                    let mut msg_out = RendezvousMessage::new();
+                    let mut res = TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    };
+                    if self.inner.serial > tar.serial {
+                        let mut cu = ConfigUpdate::new();
+                        cu.serial = self.inner.serial;
+                        cu.rendezvous_servers = (*self.rendezvous_servers).clone();
+                        res.cu = MessageField::from_option(Some(cu));
+                    }
+                    msg_out.set_test_nat_response(res);
+                    // Send response multiple times to improve reliability over lossy UDP
+                    for _ in 0..2 {
+                        socket.send(&msg_out, addr).await?;
+                        // small pause between sends
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    log::debug!("Sent TestNatResponse to {} (port {})", addr, addr.port());
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if self.pm.is_in_memory(&ph.id).await {
                         self.handle_udp_punch_hole_request(addr, ph, key).await?;
