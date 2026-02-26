@@ -200,11 +200,11 @@ impl RendezvousServer {
             .to_uppercase()
             == "Y"
         {
-            ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
+            ALWAYS_USE_RELAY.store(true, Ordering::Relaxed);
         }
         log::info!(
             "ALWAYS_USE_RELAY={}",
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) {
+            if ALWAYS_USE_RELAY.load(Ordering::Relaxed) {
                 "Y"
             } else {
                 "N"
@@ -220,12 +220,12 @@ impl RendezvousServer {
                     .to_uppercase()
                     == "Y")
         {
-            MUST_LOGIN.store(true, Ordering::SeqCst);
+            MUST_LOGIN.store(true, Ordering::Relaxed);
         }
 
         log::info!(
             "MUST_LOGIN={}",
-            if MUST_LOGIN.load(Ordering::SeqCst) {
+            if MUST_LOGIN.load(Ordering::Relaxed) {
                 "Y"
             } else {
                 "N"
@@ -925,7 +925,7 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         // if secret is not empty check token by jwt
-        if MUST_LOGIN.load(Ordering::SeqCst) {
+        if MUST_LOGIN.load(Ordering::Relaxed) {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -970,7 +970,7 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            if ALWAYS_USE_RELAY.load(Ordering::Relaxed) || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -1155,7 +1155,7 @@ impl RendezvousServer {
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
+        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::Relaxed) % self.relay_servers.len();
         self.relay_servers[i].clone()
     }
 
@@ -1275,16 +1275,16 @@ impl RendezvousServer {
             Some("always-use-relay" | "aur") => {
                 if let Some(rs) = fds.next() {
                     if rs.to_uppercase() == "Y" {
-                        ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
+                        ALWAYS_USE_RELAY.store(true, Ordering::Relaxed);
                     } else {
-                        ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+                        ALWAYS_USE_RELAY.store(false, Ordering::Relaxed);
                     }
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
                     let _ = writeln!(
                         res,
                         "ALWAYS_USE_RELAY: {:?}",
-                        ALWAYS_USE_RELAY.load(Ordering::SeqCst)
+                        ALWAYS_USE_RELAY.load(Ordering::Relaxed)
                     );
                 }
             }
@@ -1304,12 +1304,12 @@ impl RendezvousServer {
             Some("must-login" | "ml") => {
                 if let Some(rs) = fds.next() {
                     if rs.to_uppercase() == "Y" {
-                        MUST_LOGIN.store(true, Ordering::SeqCst);
+                        MUST_LOGIN.store(true, Ordering::Relaxed);
                     } else {
-                        MUST_LOGIN.store(false, Ordering::SeqCst);
+                        MUST_LOGIN.store(false, Ordering::Relaxed);
                     }
                 } else {
-                    let _ = writeln!(res, "MUST_LOGIN: {:?}", MUST_LOGIN.load(Ordering::SeqCst));
+                    let _ = writeln!(res, "MUST_LOGIN: {:?}", MUST_LOGIN.load(Ordering::Relaxed));
                 }
             }
             _ => {}

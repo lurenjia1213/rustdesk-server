@@ -100,52 +100,52 @@ fn check_params() {
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        DOWNGRADE_THRESHOLD_100.store((tmp * 100.) as _, Ordering::SeqCst);
+        DOWNGRADE_THRESHOLD_100.store((tmp * 100.) as _, Ordering::Relaxed);
     }
     log::info!(
         "DOWNGRADE_THRESHOLD: {}",
-        DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100.
+        DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) as f64 / 100.
     );
     let tmp = std::env::var("DOWNGRADE_START_CHECK")
         .map(|x| x.parse::<usize>().unwrap_or(0))
         .unwrap_or(0);
     if tmp > 0 {
-        DOWNGRADE_START_CHECK.store(tmp * 1000, Ordering::SeqCst);
+        DOWNGRADE_START_CHECK.store(tmp * 1000, Ordering::Relaxed);
     }
     log::info!(
         "DOWNGRADE_START_CHECK: {}s",
-        DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000
+        DOWNGRADE_START_CHECK.load(Ordering::Relaxed) / 1000
     );
     let tmp = std::env::var("LIMIT_SPEED")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        LIMIT_SPEED.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
+        LIMIT_SPEED.store((tmp * 1024. * 1024.) as usize, Ordering::Relaxed);
     }
     log::info!(
         "LIMIT_SPEED: {}Mb/s",
-        LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+        LIMIT_SPEED.load(Ordering::Relaxed) as f64 / 1024. / 1024.
     );
     let tmp = std::env::var("TOTAL_BANDWIDTH")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        TOTAL_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
+        TOTAL_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::Relaxed);
     }
 
     log::info!(
         "TOTAL_BANDWIDTH: {}Mb/s",
-        TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+        TOTAL_BANDWIDTH.load(Ordering::Relaxed) as f64 / 1024. / 1024.
     );
     let tmp = std::env::var("SINGLE_BANDWIDTH")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        SINGLE_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
+        SINGLE_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::Relaxed);
     }
     log::info!(
         "SINGLE_BANDWIDTH: {}Mb/s",
-        SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+        SINGLE_BANDWIDTH.load(Ordering::Relaxed) as f64 / 1024. / 1024.
     )
 }
 
@@ -230,13 +230,13 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        DOWNGRADE_THRESHOLD_100.store((v * 100.) as _, Ordering::SeqCst);
+                        DOWNGRADE_THRESHOLD_100.store((v * 100.) as _, Ordering::Relaxed);
                     }
                 }
             } else {
                 res = format!(
                     "{}\n",
-                    DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100.
+                    DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) as f64 / 100.
                 );
             }
         }
@@ -244,24 +244,27 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<usize>() {
                     if v > 0 {
-                        DOWNGRADE_START_CHECK.store(v * 1000, Ordering::SeqCst);
+                        DOWNGRADE_START_CHECK.store(v * 1000, Ordering::Relaxed);
                     }
                 }
             } else {
-                res = format!("{}s\n", DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000);
+                res = format!(
+                    "{}s\n",
+                    DOWNGRADE_START_CHECK.load(Ordering::Relaxed) / 1000
+                );
             }
         }
         Some("limit-speed" | "ls") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        LIMIT_SPEED.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
+                        LIMIT_SPEED.store((v * 1024. * 1024.) as _, Ordering::Relaxed);
                     }
                 }
             } else {
                 res = format!(
                     "{}Mb/s\n",
-                    LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                    LIMIT_SPEED.load(Ordering::Relaxed) as f64 / 1024. / 1024.
                 );
             }
         }
@@ -269,14 +272,14 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        TOTAL_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
-                        limiter.set_speed_limit(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+                        TOTAL_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::Relaxed);
+                        limiter.set_speed_limit(TOTAL_BANDWIDTH.load(Ordering::Relaxed) as _);
                     }
                 }
             } else {
                 res = format!(
                     "{}Mb/s\n",
-                    TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                    TOTAL_BANDWIDTH.load(Ordering::Relaxed) as f64 / 1024. / 1024.
                 );
             }
         }
@@ -284,13 +287,13 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        SINGLE_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
+                        SINGLE_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::Relaxed);
                     }
                 }
             } else {
                 res = format!(
                     "{}Mb/s\n",
-                    SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                    SINGLE_BANDWIDTH.load(Ordering::Relaxed) as f64 / 1024. / 1024.
                 );
             }
         }
@@ -325,7 +328,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
 
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
-    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::Relaxed) as _);
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -475,11 +478,11 @@ async fn relay(
     let mut highest_s = 0;
     let mut downgrade: bool = false;
     let mut blacked: bool = false;
-    let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
+    let sb = SINGLE_BANDWIDTH.load(Ordering::Relaxed) as f64;
     let limiter = <Limiter>::new(sb);
-    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as _);
+    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::Relaxed) as _);
     let downgrade_threshold =
-        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
+        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
     loop {
@@ -547,7 +550,7 @@ async fn relay(
                 (elapsed as _, total as _, highest_s as _, speed as _),
             );
             total_s = 0;
-            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::SeqCst)
+            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::Relaxed)
                 && !downgrade
                 && total > elapsed * downgrade_threshold
             {
