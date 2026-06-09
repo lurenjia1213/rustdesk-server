@@ -2,7 +2,7 @@ use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use hbb_common::{
-    allow_err, bail,
+    bail,
     bytes::Bytes,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
@@ -402,7 +402,9 @@ fn handle_connection(stream: TcpStream, addr: SocketAddr, limiter: &Limiter, key
     let key = key.to_owned();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
+        if let Err(err) = make_pair(stream, addr, &key, limiter, ws).await {
+            log::error!("Relay session for {} failed: {}", addr, err);
+        }
     });
 }
 
@@ -466,7 +468,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        let insert_id = PEER_INSERT_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let insert_id = PEER_INSERT_COUNTER.fetch_add(1, Ordering::Relaxed);
                         PEERS.insert(rf.uuid.clone(), (insert_id, Box::new(stream)));
                         sleep(30.).await;
                         // Only remove our own entry; a newer insertion with the
