@@ -31,8 +31,9 @@ async fn test_verify_token() {
 #[tokio::test]
 async fn test_verify_expired_token() {
     std::env::set_var("RUSTDESK_API_JWT_KEY", "testjwt");
-    // 生成一个立即过期的 token（exp = -1 秒）
-    let token = jwt::generate_token(1, -1).unwrap();
+    // Generate a token already expired by 120 seconds.
+    // jsonwebtoken v8 defaults to a 60 s leeway, so -1 s is not enough.
+    let token = jwt::generate_token(1, -120).unwrap();
 
     let result = jwt::verify_token(&token);
     assert!(result.is_err(), "Expired token should fail verification");

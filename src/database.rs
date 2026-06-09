@@ -130,7 +130,10 @@ impl Database {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
         // INSERT OR IGNORE: silently skip on duplicate id, avoids propagating
         // a UniqueViolation error when two tasks race to register the same peer.
-        sqlx::query!(
+        // We must check rows_affected() because if the insert is ignored (duplicate
+        // id), the returned guid would not match what's in the database, causing
+        // subsequent update_pk calls to silently fail (no rows matched).
+        let result = sqlx::query!(
             "insert or ignore into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
             guid,
             id,
@@ -140,7 +143,17 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
-        Ok(guid)
+        if result.rows_affected() == 0 {
+            // Race: another task already inserted a row for this id.
+            // Fetch the real guid so the caller can update correctly.
+            let real_guid: Vec<u8> =
+                sqlx::query_scalar!("select guid from peer where id = ?", id)
+                    .fetch_one(self.pool.get().await?.deref_mut())
+                    .await?;
+            Ok(real_guid)
+        } else {
+            Ok(guid)
+        }
     }
 
     pub async fn update_pk(
@@ -150,7 +163,7 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "update peer set id=?, pk=?, info=? where guid=?",
             id,
             pk,
@@ -159,6 +172,16 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+        // If no row was updated, the in-memory guid may be stale (e.g. from a
+        // prior INSERT OR IGNORE race that stored a guid not matching the DB).
+        // This should no longer happen after the insert_peer fix, but we log it
+        // as an error instead of silently losing the peer's updated data.
+        if result.rows_affected() == 0 {
+            log::error!(
+                "update_pk affected 0 rows for id={}, guid may be stale — peer data NOT persisted",
+                id
+            );
+        }
         Ok(())
     }
 }

@@ -312,7 +312,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 }
                 let _ = writeln!(
                     res,
-                    "{}: {}s {:.2}MB {}kb/s {}kb/s {}kb/s",
+                    "{}: {}s {:.2}MB {}bit/ms {}bit/ms {}bit/ms",
                     ip,
                     elapsed / 1000,
                     total as f64 / 1024. / 1024. / 8.,

@@ -389,7 +389,8 @@ impl RendezvousServer {
                             return LoopFailure::UdpSocket;
                         }
                         None => {
-                            // unreachable!() ?
+                            log::error!("udp socket stream ended unexpectedly, recreating");
+                            return LoopFailure::UdpSocket;
                         }
                     }
                 }

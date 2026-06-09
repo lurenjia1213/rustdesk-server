@@ -154,8 +154,18 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         }
         let pub_file = format!("{sk_file}.pub");
         if let Ok(mut f) = std::fs::File::create(&pub_file) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o644)).ok();
+            }
             f.write_all(pk.as_bytes()).ok();
             if let Ok(mut f) = std::fs::File::create(sk_file) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600)).ok();
+                }
                 let s = base64::encode(&sk);
                 if f.write_all(s.as_bytes()).is_ok() {
                     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
