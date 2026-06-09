@@ -96,14 +96,20 @@ fn doctor_ip(server_ip_address: std::net::IpAddr, server_address: Option<&str>) 
 
     // reverse dns lookup
     // TODO: (check) doesn't seem to do reverse lookup on OSX...
-    let reverse = lookup_addr(&server_ip_address).unwrap();
-    if let Some(server_address) = server_address {
-        if reverse == server_address {
-            println!("Reverse DNS lookup: '{reverse}' MATCHES server address");
-        } else {
-            println!(
-                "Reverse DNS lookup: '{reverse}' DOESN'T MATCH server address '{server_address}'"
-            );
+    match lookup_addr(&server_ip_address) {
+        Ok(reverse) => {
+            if let Some(server_address) = server_address {
+                if reverse == server_address {
+                    println!("Reverse DNS lookup: '{reverse}' MATCHES server address");
+                } else {
+                    println!(
+                        "Reverse DNS lookup: '{reverse}' DOESN'T MATCH server address '{server_address}'"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("Reverse DNS lookup failed: {e}");
         }
     }
 
@@ -130,7 +136,13 @@ fn doctor(server_address_unclean: &str) {
         doctor_ip(server_ipaddr, None);
     } else {
         // the passed string is not an ip address
-        let ips: Vec<std::net::IpAddr> = lookup_host(server_address).unwrap();
+        let ips = match lookup_host(server_address) {
+            Ok(ips) => ips,
+            Err(e) => {
+                println!("DNS lookup failed for '{server_address}': {e}");
+                return;
+            }
+        };
         println!("Found {} IP addresses: ", ips.len());
 
         ips.iter().for_each(|ip| println!(" - {ip}"));
