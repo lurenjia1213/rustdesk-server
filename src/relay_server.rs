@@ -466,7 +466,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        let insert_id = PEER_INSERT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let insert_id = PEER_INSERT_COUNTER.fetch_add(1, Ordering::SeqCst);
                         PEERS.insert(rf.uuid.clone(), (insert_id, Box::new(stream)));
                         sleep(30.).await;
                         // Only remove our own entry; a newer insertion with the
@@ -488,21 +488,30 @@ async fn relay(
 ) -> ResultType<()> {
     let ip = addr.ip().to_string();
     let mut tm = std::time::Instant::now();
-    let mut elapsed = 0;
-    let mut total = 0;
-    let mut total_s = 0;
-    let mut highest_s = 0;
+    let mut elapsed: usize = 0;
+    let mut total: usize = 0;
+    let mut total_s: usize = 0;
+    let mut highest_s: usize = 0;
     let mut downgrade: bool = false;
     let mut blacked: bool = false;
-    let sb = SINGLE_BANDWIDTH.load(Ordering::Relaxed) as f64;
-    let limiter = <Limiter>::new(sb);
+    let sb = SINGLE_BANDWIDTH.load(Ordering::Relaxed);
+    let limiter = <Limiter>::new(sb as f64);
     let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::Relaxed) as _);
+    // Integer math avoids float→int conversion: sb * threshold% / 100 / 1000 = sb * threshold% / 100_000
     let downgrade_threshold =
-        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) as f64 / 100. / 1000.) as usize; // in bit/ms
-    let mut timer = interval(Duration::from_secs(3));
+        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::Relaxed) / 100_000) as usize; // bit/ms
+    // These rarely change at runtime — cache them per connection.
+    let downgrade_start_check = DOWNGRADE_START_CHECK.load(Ordering::Relaxed);
     let mut last_recv_time = std::time::Instant::now();
+    // Cache BLOCKLIST/BLACKLIST results for 5 s instead of checking every 1 s.
+    let mut last_ip_check = std::time::Instant::now();
+    // Existing relay session already initialised USAGE in make_pair_.
+    // Use a 1 s tick for periodic accounting (statistics, timeout, block-list refresh)
+    // instead of running Instant::elapsed() per-packet in the loop body.
+    let mut stats_timer = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            // --- hot data path: peer → stream ---
             res = peer.recv() => {
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
@@ -522,6 +531,7 @@ async fn relay(
                     break;
                 }
             },
+            // --- hot data path: stream → peer ---
             res = stream.recv() => {
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
@@ -541,45 +551,49 @@ async fn relay(
                     break;
                 }
             },
-            _ = timer.tick() => {
+            // --- periodic accounting: runs every 1 s, not per-packet ---
+            _ = stats_timer.tick() => {
                 if last_recv_time.elapsed().as_secs() > 30 {
                     bail!("Timeout");
                 }
-            }
-        }
-
-        let n = tm.elapsed().as_millis() as usize;
-        if n >= 1_000 {
-            if BLOCKLIST.contains(&ip) {
-                log::info!("{} blocked", ip);
-                break;
-            }
-            blacked = BLACKLIST.contains(&ip);
-            tm = std::time::Instant::now();
-            let speed = total_s / n;
-            if speed > highest_s {
-                highest_s = speed;
-            }
-            elapsed += n;
-            let usage = (elapsed as _, total as _, highest_s as _, speed as _);
-            if let Some(mut entry) = USAGE.get_mut(&id) {
-                *entry = usage;
-            } else {
-                // Should rarely happen (e.g. external removal); restore the usage entry.
-                USAGE.insert(id.clone(), usage);
-            }
-            total_s = 0;
-            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::Relaxed)
-                && !downgrade
-                && total > elapsed * downgrade_threshold
-            {
-                downgrade = true;
-                log::info!(
-                    "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
-                    id,
-                    downgrade_threshold,
-                    elapsed
-                );
+                // Refresh block-list cache every 5 s to reduce DashSet lookups.
+                if last_ip_check.elapsed().as_secs() >= 5 {
+                    if BLOCKLIST.contains(&ip) {
+                        log::info!("{} blocked", ip);
+                        break;
+                    }
+                    blacked = BLACKLIST.contains(&ip);
+                    last_ip_check = std::time::Instant::now();
+                }
+                if total_s == 0 {
+                    tm = std::time::Instant::now();
+                    continue;
+                }
+                let n = tm.elapsed().as_millis() as usize;
+                let speed = total_s / n;
+                if speed > highest_s {
+                    highest_s = speed;
+                }
+                elapsed += n;
+                // USAGE entry was already initialised in make_pair_ (line 454);
+                // get_mut is the common path, and the fallback insert is dead code.
+                if let Some(mut entry) = USAGE.get_mut(&id) {
+                    *entry = (elapsed as _, total as _, highest_s as _, speed as _);
+                }
+                total_s = 0;
+                tm = std::time::Instant::now();
+                if elapsed > downgrade_start_check
+                    && !downgrade
+                    && total > elapsed * downgrade_threshold
+                {
+                    downgrade = true;
+                    log::info!(
+                        "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
+                        id,
+                        downgrade_threshold,
+                        elapsed
+                    );
+                }
             }
         }
     }
