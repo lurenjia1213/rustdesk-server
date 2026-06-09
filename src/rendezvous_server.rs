@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose};
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -1782,10 +1783,10 @@ impl RendezvousServer {
     fn get_server_sk(key: &str) -> (String, Option<sign::SecretKey>) {
         let mut out_sk = None;
         let mut key = key.to_owned();
-        if let Ok(sk) = base64::decode(&key) {
+        if let Ok(sk) = general_purpose::STANDARD.decode(&key) {
             if sk.len() == sign::SECRETKEYBYTES {
                 log::info!("The key is a crypto private key");
-                key = base64::encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
+                key = general_purpose::STANDARD.encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
                 let mut tmp = [0u8; sign::SECRETKEYBYTES];
                 tmp[..].copy_from_slice(&sk);
                 out_sk = Some(sign::SecretKey(tmp));

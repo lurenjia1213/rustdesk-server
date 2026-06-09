@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose};
 use clap::App;
 use dashmap::DashMap;
 use hbb_common::{
@@ -127,11 +128,11 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
             let contents = contents.trim();
-            let sk = base64::decode(contents).unwrap_or_default();
+            let sk = general_purpose::STANDARD.decode(contents).unwrap_or_default();
             if sk.len() == sign::SECRETKEYBYTES {
                 let mut tmp = [0u8; sign::SECRETKEYBYTES];
                 tmp[..].copy_from_slice(&sk);
-                let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+                let pk = general_purpose::STANDARD.encode(&tmp[sign::SECRETKEYBYTES / 2..]);
                 log::info!("Private key comes from {}", sk_file);
                 return (pk, Some(sign::SecretKey(tmp)));
             } else {
@@ -143,7 +144,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
     } else {
         let gen_func = || {
             let (tmp, sk) = sign::gen_keypair();
-            (base64::encode(tmp), sk)
+            (general_purpose::STANDARD.encode(tmp), sk)
         };
         let (mut pk, mut sk) = gen_func();
         for _ in 0..300 {
@@ -166,7 +167,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
                     use std::os::unix::fs::PermissionsExt;
                     f.set_permissions(std::fs::Permissions::from_mode(0o600)).ok();
                 }
-                let s = base64::encode(&sk);
+                let s = general_purpose::STANDARD.encode(&sk);
                 if f.write_all(s.as_bytes()).is_ok() {
                     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
                     log::debug!("Public key: {}", pk);

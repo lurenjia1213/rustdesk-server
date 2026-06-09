@@ -1,5 +1,6 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use dashmap::{DashMap, DashSet};
 use hbb_common::{
     bail,
@@ -604,10 +605,10 @@ async fn relay(
 
 fn get_server_sk(key: &str) -> String {
     let mut key = key.to_owned();
-    if let Ok(sk) = base64::decode(&key) {
+    if let Ok(sk) = general_purpose::STANDARD.decode(&key) {
         if sk.len() == sign::SECRETKEYBYTES {
             log::info!("The key is a crypto private key");
-            key = base64::encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
+            key = general_purpose::STANDARD.encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
         }
     }
 

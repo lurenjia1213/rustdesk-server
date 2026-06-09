@@ -1,11 +1,8 @@
-use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
-//use sqlx::postgres::PgPoolOptions;
-//use sqlx::mysql::MySqlPoolOptions;
 
 type Pool = deadpool::managed::Pool<DbPool>;
 
@@ -13,37 +10,42 @@ pub struct DbPool {
     url: String,
 }
 
-#[async_trait]
 impl deadpool::managed::Manager for DbPool {
     type Type = SqliteConnection;
     type Error = SqlxError;
-    async fn create(&self) -> Result<SqliteConnection, SqlxError> {
-        let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
-        opt.log_statements(log::LevelFilter::Debug);
-        let mut conn = SqliteConnection::connect_with(&opt).await?;
-        // Enable WAL mode for better concurrent read performance
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&mut conn)
-            .await
-            .ok();
-        // Reduce fsync overhead while keeping crash safety
-        sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&mut conn)
-            .await
-            .ok();
-        Ok(conn)
+    fn create(&self) -> impl std::future::Future<Output = Result<SqliteConnection, SqlxError>> + Send {
+        let url = self.url.clone();
+        async move {
+            let mut opt = SqliteConnectOptions::from_str(&url).unwrap();
+            opt.log_statements(log::LevelFilter::Debug);
+            let mut conn = SqliteConnection::connect_with(&opt).await?;
+            // Enable WAL mode for better concurrent read performance
+            sqlx::query("PRAGMA journal_mode=WAL")
+                .execute(&mut conn)
+                .await
+                .ok();
+            // Reduce fsync overhead while keeping crash safety
+            sqlx::query("PRAGMA synchronous=NORMAL")
+                .execute(&mut conn)
+                .await
+                .ok();
+            Ok(conn)
+        }
     }
-    async fn recycle(
+    fn recycle(
         &self,
         mut obj: &mut SqliteConnection,
-    ) -> deadpool::managed::RecycleResult<SqlxError> {
-        // Use SELECT 1 instead of ping() — more reliable for SQLite
-        sqlx::query("SELECT 1")
-            .execute(obj.deref_mut())
-            .await
-            .map(|_| ())
-            .map_err(deadpool::managed::RecycleError::Backend)?;
-        Ok(())
+        _metrics: &deadpool::managed::Metrics,
+    ) -> impl std::future::Future<Output = deadpool::managed::RecycleResult<SqlxError>> + Send {
+        async move {
+            // Use SELECT 1 instead of ping() — more reliable for SQLite
+            sqlx::query("SELECT 1")
+                .execute(obj.deref_mut())
+                .await
+                .map(|_| ())
+                .map_err(deadpool::managed::RecycleError::Backend)?;
+            Ok(())
+        }
     }
 }
 
@@ -73,12 +75,12 @@ impl Database {
             .parse()
             .unwrap_or(4);
         log::info!("MAX_DATABASE_CONNECTIONS={}", n);
-        let pool = Pool::new(
-            DbPool {
+        let pool = Pool::builder(DbPool {
                 url: url.to_owned(),
-            },
-            n,
-        );
+            })
+            .max_size(n)
+            .build()
+            .unwrap();
         let _ = pool.get().await?; // test
         let db = Database { pool };
         db.create_tables().await?;
