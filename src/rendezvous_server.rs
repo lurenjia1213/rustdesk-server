@@ -34,11 +34,12 @@ use hbb_common::{
     udp::FramedSocket,
     AddrMangle, ResultType,
 };
+use dashmap::DashMap;
 use ipnetwork::Ipv4Network;
 
 use crate::jwt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
@@ -128,8 +129,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     /// Stores TCP sink + insertion timestamp for each in-flight TCP punch session.
-    /// The timestamp is used by the periodic cleanup timer to evict stale entries.
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, Instant)>>>,
+    /// DashMap provides per-shard locking so many punch requests can proceed in parallel.
+    tcp_punch: Arc<DashMap<SocketAddr, (Sink, Instant)>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -137,8 +138,7 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     /// Stores WebSocket sink + insertion timestamp for each registered WS peer.
-    /// The timestamp allows the cleanup timer to evict long-idle entries.
-    ws_map: Arc<Mutex<HashMap<SocketAddr, (Sink, Instant)>>>,
+    ws_map: Arc<DashMap<SocketAddr, (Sink, Instant)>>,
 }
 
 enum LoopFailure {
@@ -181,7 +181,7 @@ impl RendezvousServer {
         // For privacy use per connection key pair
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let mut rs = Self {
-            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            tcp_punch: Arc::new(DashMap::new()),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -197,7 +197,7 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
-            ws_map: Arc::new(Mutex::new(HashMap::new())),
+            ws_map: Arc::new(DashMap::new()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -348,20 +348,18 @@ impl RendezvousServer {
                 _ = timer_cleanup.tick() => {
                     // TCP punch entries should complete within 90 s; drop stragglers.
                     {
-                        let mut lock = self.tcp_punch.lock().await;
-                        let before = lock.len();
-                        lock.retain(|_, (_, t)| t.elapsed().as_secs() < 90);
-                        let after = lock.len();
+                        let before = self.tcp_punch.len();
+                        self.tcp_punch.retain(|_, (_, t)| t.elapsed().as_secs() < 90);
+                        let after = self.tcp_punch.len();
                         if before != after {
                             log::info!("tcp_punch cleanup: removed {} stale entries, {} remaining", before - after, after);
                         }
                     }
                     // WS map entries for registered peers; evict if idle for 300 s.
                     {
-                        let mut lock = self.ws_map.lock().await;
-                        let before = lock.len();
-                        lock.retain(|_, (_, t)| t.elapsed().as_secs() < 300);
-                        let after = lock.len();
+                        let before = self.ws_map.len();
+                        self.ws_map.retain(|_, (_, t)| t.elapsed().as_secs() < 300);
+                        let after = self.ws_map.len();
                         if before != after {
                             log::info!("ws_map cleanup: removed {} stale entries, {} remaining", before - after, after);
                         }
@@ -603,8 +601,6 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch
-                            .lock()
-                            .await
                             .insert(try_into_v4(addr), (sink, Instant::now()));
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
@@ -614,8 +610,6 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch
-                            .lock()
-                            .await
                             .insert(try_into_v4(addr), (sink, Instant::now()));
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
@@ -691,8 +685,6 @@ impl RendezvousServer {
                                 // for ws, we can only get addr when register_pk
                                 if let Some(sink) = sink.take() {
                                     self.ws_map
-                                        .lock()
-                                        .await
                                         .insert(try_into_v4(addr), (sink, Instant::now()));
                                 }
                             }
@@ -797,7 +789,7 @@ impl RendezvousServer {
         if id.len() < 6 {
             return Err(UUID_MISMATCH);
             //return Err(send_rk_res(socket, addr, UUID_MISMATCH).await);
-        } else if !self.check_ip_blocker(&ip, &id).await {
+        } else if !self.check_ip_blocker(&ip, &id) {
             return Err(TOO_FREQUENT);
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
         }
@@ -850,8 +842,8 @@ impl RendezvousServer {
         req_pk.1 = Instant::now();
         peer.write().await.reg_pk = req_pk;
         if ip_changed {
-            let mut lock = IP_CHANGES.lock().await;
-            if let Some((tm, ips)) = lock.get_mut(&id) {
+            if let Some(mut entry) = IP_CHANGES.get_mut(&id) {
+                let (tm, ips) = entry.value_mut();
                 if tm.elapsed().as_secs() > IP_CHANGE_DUR {
                     *tm = Instant::now();
                     ips.clear();
@@ -862,7 +854,7 @@ impl RendezvousServer {
                     ips.insert(ip.clone(), 1);
                 }
             } else {
-                lock.insert(
+                IP_CHANGES.insert(
                     id.clone(),
                     (Instant::now(), HashMap::from([(ip.clone(), 1)])),
                 );
@@ -1005,10 +997,8 @@ impl RendezvousServer {
         // received it, causing UDP punch to silently fail every time.
         let tcp_sink = self
             .tcp_punch
-            .lock()
-            .await
             .remove(&try_into_v4(addr_a))
-            .map(|(s, _)| s);
+            .map(|(_, (s, _))| s);
         if let Some(mut sink) = tcp_sink {
             // A has a TCP punch sink – deliver via TCP (send twice for
             // reliability, matching the original duplicate-send pattern).
@@ -1073,10 +1063,8 @@ impl RendezvousServer {
         // as handle_hole_sent: A connects via TCP so we must reply on TCP.
         let tcp_sink = self
             .tcp_punch
-            .lock()
-            .await
             .remove(&try_into_v4(addr_a))
-            .map(|(s, _)| s);
+            .map(|(_, (s, _))| s);
         if let Some(mut sink) = tcp_sink {
             sink.send(&msg_out).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1143,6 +1131,9 @@ impl RendezvousServer {
                 }
             }
         }
+        // Cache global atomic flags once per request
+        let always_use_relay = ALWAYS_USE_RELAY.load(Ordering::Relaxed);
+        let force_punch = FORCE_PUNCH.load(Ordering::Relaxed);
         let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -1173,52 +1164,10 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            // Track whether we are forcing relay due to LAN/WAN mismatch
             let lan_wan_mismatch = peer_is_lan ^ is_lan;
-            if ALWAYS_USE_RELAY.load(Ordering::Relaxed) || lan_wan_mismatch {
-                if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
-                    relay_server = self.inner.local_ip.clone()
-                }
-                if lan_wan_mismatch {
-                    log::debug!(
-                        "LAN/WAN mismatch (peer_is_lan={} is_lan={}) for {:?}↔{:?}: will use relay",
-                        peer_is_lan,
-                        is_lan,
-                        addr,
-                        peer_addr
-                    );
-                }
-                ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
-            }
-            // Override SYMMETRIC → ASYMMETRIC only when BOTH ends are known to have IPv6.
-            //
-            // Rationale:
-            //   • If only A has IPv6, B will call start_ipv6() but get_ipv6_socket() returns
-            //     None, so B's PunchHoleSent.socket_addr_v6 stays empty.  A receives an empty
-            //     socket_addr_v6 and won't even attempt IPv6 – the ASYMMETRIC override gained
-            //     nothing but delayed fallback to relay.
-            //   • When BOTH have IPv6, direct IPv6 punch succeeds far more often because
-            //     IPv6 typically does not go through NAT at all.
-            //   • We intentionally leave SYMMETRIC intact when lan_wan_mismatch forced it:
-            //     the client (B) still starts its IPv6 listener before entering the relay path
-            //     and will include socket_addr_v6 in RelayResponse, letting A race relay vs
-            //     direct IPv6 – which is faster than waiting for TCP punch to time out.
-            let a_has_ipv6 = !ph.socket_addr_v6.is_empty();
-            if !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
-                && a_has_ipv6
-                && peer_has_ipv6
-                && !lan_wan_mismatch
-            {
-                if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC) {
-                    log::debug!(
-                        "Both A ({:?}) and B ({:?}) have IPv6 – overriding SYMMETRIC to ASYMMETRIC",
-                        addr,
-                        peer_addr
-                    );
-                    ph.nat_type = NatType::ASYMMETRIC.into();
-                }
-            }
+
+            // Compute same_intranet early: when true we skip all nat_type calculations
+            // because the server sends FetchLocalAddr (not PunchHole) to B.
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
                     // Compare IPs for same-host detection, handling the case where one peer
@@ -1236,7 +1185,13 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
+
             if same_intranet {
+                if always_use_relay || lan_wan_mismatch {
+                    if peer_is_lan {
+                        relay_server = self.inner.local_ip.clone();
+                    }
+                }
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
                     id,
@@ -1256,13 +1211,51 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
-                // Apply FORCE_PUNCH as the final nat_type override: instruct B to attempt a
-                // direct hole punch even when A appears to be behind a SYMMETRIC NAT.
-                // ALWAYS_USE_RELAY takes precedence and is never overridden here.
-                let final_nat_type = if FORCE_PUNCH.load(Ordering::Relaxed)
-                    && !ALWAYS_USE_RELAY.load(Ordering::Relaxed)
-                    && ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+                // --- nat_type decision for cross-network punch ---
+                // Track whether the nat_type currently signals SYMMETRIC (will force relay).
+                // We use a bool to avoid repeated protobuf enum_value() parsing.
+                let original_nat_type = ph.nat_type.enum_value();
+                let mut is_symmetric = original_nat_type == Ok(NatType::SYMMETRIC);
+
+                // Server-enforced relay: ALWAYS_USE_RELAY or LAN/WAN mismatch
+                if always_use_relay || lan_wan_mismatch {
+                    if peer_is_lan {
+                        // https://github.com/rustdesk/rustdesk-server/issues/24
+                        relay_server = self.inner.local_ip.clone();
+                    }
+                    if lan_wan_mismatch {
+                        log::debug!(
+                            "LAN/WAN mismatch (peer_is_lan={} is_lan={}) for {:?}↔{:?}: will use relay",
+                            peer_is_lan,
+                            is_lan,
+                            addr,
+                            peer_addr
+                        );
+                    }
+                    ph.nat_type = NatType::SYMMETRIC.into();
+                    is_symmetric = true;
+                }
+
+                // Override SYMMETRIC → ASYMMETRIC only when BOTH ends have IPv6.
+                let a_has_ipv6 = !ph.socket_addr_v6.is_empty();
+                if !always_use_relay
+                    && a_has_ipv6
+                    && peer_has_ipv6
+                    && !lan_wan_mismatch
+                    && is_symmetric
                 {
+                    log::debug!(
+                        "Both A ({:?}) and B ({:?}) have IPv6 – overriding SYMMETRIC to ASYMMETRIC",
+                        addr,
+                        peer_addr
+                    );
+                    ph.nat_type = NatType::ASYMMETRIC.into();
+                    is_symmetric = false;
+                }
+
+                // FORCE_PUNCH: admin override to attempt direct punch even through SYMMETRIC NAT.
+                // ALWAYS_USE_RELAY takes precedence.
+                let final_nat_type = if force_punch && !always_use_relay && is_symmetric {
                     log::debug!(
                         "FORCE_PUNCH: overriding nat_type → ASYMMETRIC in PunchHole to B {:?}",
                         peer_addr
@@ -1271,8 +1264,7 @@ impl RendezvousServer {
                 } else {
                     ph.nat_type
                 };
-                let server_force_relay =
-                    ALWAYS_USE_RELAY.load(Ordering::Relaxed) || lan_wan_mismatch;
+                let server_force_relay = always_use_relay || lan_wan_mismatch;
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
                     nat_type: final_nat_type,
@@ -1318,10 +1310,8 @@ impl RendezvousServer {
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
         let mut tcp = self
             .tcp_punch
-            .lock()
-            .await
             .remove(&try_into_v4(addr))
-            .map(|(s, _)| s);
+            .map(|(_, (s, _))| s);
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
         });
@@ -1342,10 +1332,8 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink = self
             .tcp_punch
-            .lock()
-            .await
             .remove(&try_into_v4(addr))
-            .map(|(s, _)| s);
+            .map(|(_, (s, _))| s);
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
     }
@@ -1362,10 +1350,8 @@ impl RendezvousServer {
         if let Some(peer_addr) = to_addr {
             let mut sink = self
                 .ws_map
-                .lock()
-                .await
                 .remove(&try_into_v4(peer_addr))
-                .map(|(s, _)| s);
+                .map(|(_, (s, _))| s);
             if let Some(s) = sink.as_mut() {
                 // B has a live WebSocket – send the PunchHole notification twice for reliability.
                 log::debug!(
@@ -1419,32 +1405,34 @@ impl RendezvousServer {
         Ok(())
     }
 
-    async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
-        let mut lock = IP_BLOCKER.lock().await;
+    fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
         let now = Instant::now();
-        if let Some(old) = lock.get_mut(ip) {
-            let counter = &mut old.0;
-            if counter.1.elapsed().as_secs() > IP_BLOCK_DUR {
-                counter.0 = 0;
-            } else if counter.0 > 30 {
+        if let Some(mut old) = IP_BLOCKER.get_mut(ip) {
+            let ((ref mut counter, ref mut counter_time), (ref mut ids, ref mut ids_time)) =
+                old.value_mut();
+            if counter_time.elapsed().as_secs() > IP_BLOCK_DUR {
+                *counter = 0;
+            } else if *counter > 30 {
                 return false;
             }
-            counter.0 += 1;
-            counter.1 = now;
+            *counter += 1;
+            *counter_time = now;
 
-            let counter = &mut old.1;
-            let is_new = counter.0.get(id).is_none();
-            if counter.1.elapsed().as_secs() > DAY_SECONDS {
-                counter.0.clear();
-            } else if counter.0.len() > 300 {
+            let is_new = ids.get(id).is_none();
+            if ids_time.elapsed().as_secs() > DAY_SECONDS {
+                ids.clear();
+            } else if ids.len() > 300 {
                 return !is_new;
             }
             if is_new {
-                counter.0.insert(id.to_owned());
+                ids.insert(id.to_owned());
             }
-            counter.1 = now;
+            *ids_time = now;
         } else {
-            lock.insert(ip.to_owned(), ((0, now), (Default::default(), now)));
+            IP_BLOCKER.insert(
+                ip.to_owned(),
+                ((0, now), (HashSet::from([id.to_owned()]), now)),
+            );
         }
         true
     }
@@ -1494,17 +1482,17 @@ impl RendezvousServer {
                 }
             }
             Some("ip-blocker" | "ib") => {
-                let mut lock = IP_BLOCKER.lock().await;
-                lock.retain(|&_, (a, b)| {
+                IP_BLOCKER.retain(|_, (a, b)| {
                     a.1.elapsed().as_secs() <= IP_BLOCK_DUR
                         || b.1.elapsed().as_secs() <= DAY_SECONDS
                 });
-                res = format!("{}\n", lock.len());
+                res = format!("{}\n", IP_BLOCKER.len());
                 let ip = fds.next();
                 let mut start = ip.map(|x| x.parse::<i32>().unwrap_or(-1)).unwrap_or(-1);
                 if start < 0 {
                     if let Some(ip) = ip {
-                        if let Some((a, b)) = lock.get(ip) {
+                        if let Some(entry) = IP_BLOCKER.get(ip) {
+                            let (a, b) = entry.value();
                             let _ = writeln!(
                                 res,
                                 "{}/{}s {}/{}s",
@@ -1515,14 +1503,14 @@ impl RendezvousServer {
                             );
                         }
                         if fds.next() == Some("-") {
-                            lock.remove(ip);
+                            IP_BLOCKER.remove(ip);
                         }
                     } else {
                         start = 0;
                     }
                 }
                 if start >= 0 {
-                    let mut it = lock.iter();
+                    let mut it = IP_BLOCKER.iter();
                     for i in 0..(start + 10) {
                         let x = it.next();
                         if x.is_none() {
@@ -1531,7 +1519,8 @@ impl RendezvousServer {
                         if i < start {
                             continue;
                         }
-                        if let Some((ip, (a, b))) = x {
+                        if let Some(entry) = x {
+                            let (ip, (a, b)) = (entry.key(), entry.value());
                             let _ = writeln!(
                                 res,
                                 "{}: {}/{}s {}/{}s",
@@ -1546,25 +1535,25 @@ impl RendezvousServer {
                 }
             }
             Some("ip-changes" | "ic") => {
-                let mut lock = IP_CHANGES.lock().await;
-                lock.retain(|&_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2 && v.1.len() > 1);
-                res = format!("{}\n", lock.len());
+                IP_CHANGES.retain(|_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2 && v.1.len() > 1);
+                res = format!("{}\n", IP_CHANGES.len());
                 let id = fds.next();
                 let mut start = id.map(|x| x.parse::<i32>().unwrap_or(-1)).unwrap_or(-1);
                 if !(0..=10_000_000).contains(&start) {
                     if let Some(id) = id {
-                        if let Some((tm, ips)) = lock.get(id) {
+                        if let Some(entry) = IP_CHANGES.get(id) {
+                            let (tm, ips) = entry.value();
                             let _ = writeln!(res, "{}s {:?}", tm.elapsed().as_secs(), ips);
                         }
                         if fds.next() == Some("-") {
-                            lock.remove(id);
+                            IP_CHANGES.remove(id);
                         }
                     } else {
                         start = 0;
                     }
                 }
                 if start >= 0 {
-                    let mut it = lock.iter();
+                    let mut it = IP_CHANGES.iter();
                     for i in 0..(start + 10) {
                         let x = it.next();
                         if x.is_none() {
@@ -1573,7 +1562,8 @@ impl RendezvousServer {
                         if i < start {
                             continue;
                         }
-                        if let Some((id, (tm, ips))) = x {
+                        if let Some(entry) = x {
+                            let (id, (tm, ips)) = (entry.key(), entry.value());
                             let _ = writeln!(res, "{}: {}s {:?}", id, tm.elapsed().as_secs(), ips,);
                         }
                     }
@@ -1748,7 +1738,7 @@ impl RendezvousServer {
             }
         }
         if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            self.tcp_punch.remove(&try_into_v4(addr));
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())

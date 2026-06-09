@@ -1,23 +1,24 @@
 use crate::common::*;
 use crate::database;
+use dashmap::DashMap;
 use hbb_common::{
     bytes::Bytes,
     log,
     rendezvous_proto::*,
-    tokio::sync::{Mutex, RwLock},
+    tokio::sync::RwLock,
     ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 
-type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
+pub(crate) type IpBlockMap = DashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
 #[allow(dead_code)]
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
-type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
+pub(crate) type IpChangesMap = DashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
-    pub(crate) static ref IP_BLOCKER: Mutex<IpBlockMap> = Default::default();
+    pub(crate) static ref IP_BLOCKER: IpBlockMap = Default::default();
     pub(crate) static ref USER_STATUS: RwLock<UserStatusMap> = Default::default();
-    pub(crate) static ref IP_CHANGES: Mutex<IpChangesMap> = Default::default();
+    pub(crate) static ref IP_CHANGES: IpChangesMap = Default::default();
 }
 pub const IP_CHANGE_DUR: u64 = 180;
 pub const IP_CHANGE_DUR_X2: u64 = IP_CHANGE_DUR * 2;
